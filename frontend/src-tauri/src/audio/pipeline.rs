@@ -688,6 +688,33 @@ impl AudioCapture {
     }
 }
 
+/// Tracks which source (mic or system) carried more energy since the last
+/// speech segment was emitted. Used to label segments as ME (mic) or THEM (system).
+#[derive(Default)]
+struct SourceDominance {
+    mic_energy: f64,
+    system_energy: f64,
+}
+
+impl SourceDominance {
+    fn add(&mut self, mic_window: &[f32], sys_window: &[f32]) {
+        self.mic_energy += mic_window.iter().map(|&x| (x as f64) * (x as f64)).sum::<f64>();
+        self.system_energy += sys_window.iter().map(|&x| (x as f64) * (x as f64)).sum::<f64>();
+    }
+
+    /// Returns the dominant source since the last call and resets the counters.
+    fn take(&mut self) -> DeviceType {
+        let dominant = if self.system_energy > self.mic_energy {
+            DeviceType::System
+        } else {
+            DeviceType::Microphone
+        };
+        self.mic_energy = 0.0;
+        self.system_energy = 0.0;
+        dominant
+    }
+}
+
 /// VAD-driven audio processing pipeline
 /// Uses Voice Activity Detection to segment speech in real-time and send only speech to Whisper
 pub struct AudioPipeline {
@@ -705,6 +732,8 @@ pub struct AudioPipeline {
     // PROFESSIONAL AUDIO MIXING: Ring buffer + RMS-based mixer
     ring_buffer: AudioMixerRingBuffer,
     mixer: ProfessionalAudioMixer,
+    // Speaker labels: which source dominated since the last emitted segment
+    source_dominance: SourceDominance,
     // Recording sender for pre-mixed audio
     recording_sender_for_mixed: Option<mpsc::UnboundedSender<AudioChunk>>,
 }
@@ -784,6 +813,7 @@ impl AudioPipeline {
             // Initialize professional audio mixing
             ring_buffer,
             mixer,
+            source_dominance: SourceDominance::default(),
             recording_sender_for_mixed: None,  // Will be set by manager
         })
     }
@@ -849,6 +879,7 @@ impl AudioPipeline {
                         if let Some((mic_window, sys_window)) = self.ring_buffer.extract_window() {
                             // Simple mixing without aggressive ducking
                             let mixed_clean = self.mixer.mix_window(&mic_window, &sys_window);
+                            self.source_dominance.add(&mic_window, &sys_window);
 
                             // NO POST-GAIN NEEDED: Microphone already normalized by EBU R128 to -23 LUFS
                             // This is broadcast-standard loudness (Netflix/YouTube/Spotify level)
@@ -859,6 +890,12 @@ impl AudioPipeline {
                             // STEP 3: Send mixed audio for transcription (VAD + Whisper)
                             match self.vad_processor.process_audio(&mixed_with_gain) {
                                 Ok(speech_segments) => {
+                                    // One label per VAD batch: the source that dominated since the last one
+                                    let dominant_source = if speech_segments.is_empty() {
+                                        DeviceType::Microphone
+                                    } else {
+                                        self.source_dominance.take()
+                                    };
                                     for segment in speech_segments {
                                         let duration_ms = segment.end_timestamp_ms - segment.start_timestamp_ms;
 
@@ -871,7 +908,7 @@ impl AudioPipeline {
                                                 sample_rate: 16000,
                                                 timestamp: segment.start_timestamp_ms / 1000.0,
                                                 chunk_id: self.chunk_id_counter,
-                                                device_type: DeviceType::Microphone,  // Mixed audio
+                                                device_type: dominant_source.clone(),  // Dominant source (ME/THEM label)
                                             };
 
                                             if let Err(e) = self.transcription_sender.send(transcription_chunk) {
@@ -928,6 +965,11 @@ impl AudioPipeline {
         // Flush any remaining audio from VAD processor and send segments to transcription
         match self.vad_processor.flush() {
             Ok(final_segments) => {
+                let dominant_source = if final_segments.is_empty() {
+                    DeviceType::Microphone
+                } else {
+                    self.source_dominance.take()
+                };
                 for segment in final_segments {
                     let duration_ms = segment.end_timestamp_ms - segment.start_timestamp_ms;
 
@@ -941,7 +983,7 @@ impl AudioPipeline {
                             sample_rate: 16000,
                             timestamp: segment.start_timestamp_ms / 1000.0,
                             chunk_id: self.chunk_id_counter,
-                            device_type: DeviceType::Microphone,
+                            device_type: dominant_source.clone(),
                         };
 
                         if let Err(e) = self.transcription_sender.send(transcription_chunk) {
